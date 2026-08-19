@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal
-
+from pydantic import BaseModel
 
 @dataclass
 class Order:
@@ -17,4 +17,9 @@ class Trade:
         self.quantity = quantity
         self.price = price
         self.timestamp = timestamp
+
+class OrderRequest (BaseModel):
+    side: str
+    price: int
+    quantity: int
             
