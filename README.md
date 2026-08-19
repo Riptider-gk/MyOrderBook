@@ -47,20 +47,52 @@ benchmark.py   -> throughput/latency benchmark, persist=True vs persist=False
 
 **The matching algorithm itself is fast — heap operations on 1,000 orders complete in well under a millisecond.** The ~6,300x slowdown with persistence enabled comes entirely from synchronous SQLite writes: each trade triggers multiple `INSERT`/`UPDATE` calls, each opening a connection and forcing a disk-durable `commit()`. This isolates the actual bottleneck in the system — not the matching logic, but I/O — which is the same bottleneck real trading infrastructure spends most of its engineering effort working around (batching, async writes, in-memory-first with async durability, etc.).
 
+## Testing
+
+A `pytest` suite (`test_orderbook.py`) covers the matching engine's core correctness properties:
+
+- **Partial fills across multiple price levels** — a single incoming order matching against several resting orders at different prices in one pass.
+- **Price-time priority tie-breaking** — when two resting orders share the same price, the earlier-submitted order fills first.
+- **`persist=True` / `persist=False` equivalence** — the same order sequence run through both configurations produces identical trades, proving the persistence toggle only affects I/O, never matching logic.
+- **Concurrent order submission** — multiple threads submitting to the same `OrderBook` simultaneously, asserting no exceptions and a fully consistent final book state.
+
+```bash
+pytest test_orderbook.py -v
+```
+
+## Concurrency
+
+`OrderBook.add_order` is wrapped in a `threading.Lock`, so only one thread can execute the method body at a time — this rules out two threads concurrently popping the same resting order off a heap, or interleaving a partial fill in a way that corrupts book state.
+
+**Benchmark: 4 threads, 250 orders each (1,000 total), same-price band as the single-threaded benchmark, `persist=False`:**
+
+| Configuration | Throughput |
+|---|---|
+| With lock | ~210,135 orders/sec |
+| Without lock | ~208,773 orders/sec |
+
+The two numbers are effectively identical, and the concurrent-load test also passed consistently with the lock removed. This is expected, not a sign the lock is unnecessary: CPython's Global Interpreter Lock (GIL) already serializes bytecode execution across threads, so for a fast, purely in-memory, CPU-bound workload like this, the GIL is doing most of the serialization the lock was added for. The lock still matters because:
+
+- It makes thread-safety an explicit, logical guarantee of the code rather than an incidental side-effect of a specific Python implementation detail.
+- It would matter more under workloads involving I/O (e.g. `persist=True`, where a thread can be swapped out mid-database-call), or under Python implementations/future GIL-free builds where bytecode execution isn't serialized the same way.
+- Correctness shouldn't depend on relying on the GIL — that's an implementation detail, not a language guarantee.
+
+In short: the lock buys correctness-by-design, not a measured throughput change in this benchmark — and the benchmark result itself is evidence for *why* the GIL matters when reasoning about concurrency in CPython.
+
 ## Known limitations / deliberate scope tradeoffs
 
 These are intentional cuts for a 1-day build, not oversights:
 
-- **Single-threaded, single-process** — no concurrent order handling. A real matching engine would need to reason carefully about concurrent access to the order book.
+- **Lock-based concurrency, not lock-free** — a single `threading.Lock` serializes all order submissions. This is safe but doesn't scale throughput with thread count; a production system handling real concurrent load would look at sharding the book (e.g. by symbol) or a single-writer queue architecture instead.
 - **JSON over HTTP, not a binary protocol** — real low-latency systems typically use custom binary formats (or FIX) for order gateways; JSON was a deliberate simplicity tradeoff.
 - **Synchronous DB writes on the hot path** — every trade blocks on a disk commit. A production system would decouple matching from persistence (e.g. write-ahead log, async batched writes) — the benchmark above is direct evidence for why that separation matters.
 - **Self-assigned order IDs** — IDs are generated in application code rather than by the database, which required care around ID collisions across restarts.
 
 ## Possible extensions
 
-- Rewrite the matching core in C++ and compare latency against the Python version.
+- Rewrite the matching core in C++ and compare latency against the Python version — and against a GIL-free Python build, to isolate how much of the concurrency benchmark result is CPython-specific.
 - Move persistence off the synchronous hot path (write-ahead log / async batched commits) and re-run the benchmark to quantify the recovered throughput.
-- Add basic concurrency handling for simultaneous order submission.
+- Shard the book (e.g. by symbol) to get real parallel throughput gains under concurrent load, rather than lock-serialized safety alone.
 
 ## Running it
 
@@ -74,4 +106,10 @@ uvicorn main:app --reload
 
 # run the benchmark
 python3 benchmark.py
+
+# run the concurrent-load benchmark
+python3 benchmark_concurrency.py
+
+# run the test suite
+pytest test_orderbook.py -v
 ```

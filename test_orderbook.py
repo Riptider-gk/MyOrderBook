@@ -1,6 +1,7 @@
 from orderbook import OrderBook
 from order import Order
 import time
+import threading
 
 def test_partial_fill_accross_price_levels():
     book = OrderBook(persist=False)
@@ -51,3 +52,28 @@ def test_persist_toggle_doesnt_affect_matching_logic():
         book_true.add_order(o)
 
     assert book_false.trades==book_true.trades
+
+def test_concurrent_order_submission():
+    book=OrderBook(persist=False)
+    errors=[]
+
+    def submit_orders(start_id, side, price):
+          try:
+               for i in range(50):
+                    order=Order(start_id+i, side, price, 1, time.time())
+                    book.add_order(order)
+          except Exception as e:
+               errors.append(e)
+
+    threads=[
+            threading.Thread(target=submit_orders, args=(0,"sell", 100)),
+            threading.Thread(target=submit_orders, args=(1000,"buy", 100))
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors==[]
+            
